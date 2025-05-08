@@ -123,47 +123,35 @@ def similarity_search(query, top_k=3):
     Returns:
         List[str]: List of top-k relevant text chunks.
     """
-    # Embed the query and ensure it has shape (1, 512)
     query_vec = np.array(embed_text(query)).reshape(1, -1)
-    
-    # Retrieve all document keys from Redis
-    all_docs = [key for key in redis_client.scan_iter("doc:*")]
-    
+    all_docs = list(redis_client.scan_iter("doc:*"))
     scored = []
-    
-    # Loop through all documents
+
     for key in all_docs:
-        # Retrieve the text and vector from Redis
         text = redis_client.hget(key, "text")
-        vec = json.loads(redis_client.hget(key, "vector"))
-        
-        # Convert the vector into a numpy array
-        vec = np.array(vec)
-        
-        # Debugging: Print the shapes of the query and document vectors
-        print(f"Query vector shape: {query_vec.shape}")
-        print(f"Document vector shape: {vec.shape}")
-        
-        # Check if the document vector has the correct shape (512,)
+        vector_json = redis_client.hget(key, "vector")
+
+        if vector_json is None or text is None:
+            print(f"Skipping key {key} — vector or text missing")
+            continue
+
+        try:
+            vec = np.array(json.loads(vector_json))
+        except Exception as e:
+            print(f"Error decoding vector for key {key}: {e}")
+            continue
+
         if vec.shape[0] != 512:
-            print(f"Skipping document with vector of shape {vec.shape}")
-            continue  # Skip this document
-        
-        # Reshape the document vector to (1, 512) if it's 1D
-        if vec.ndim == 1:
-            vec = vec.reshape(1, -1)
-        
-        # Compute the cosine similarity between the query vector and document vector
+            print(f"Skipping key {key} — vector shape invalid: {vec.shape}")
+            continue
+
+        vec = vec.reshape(1, -1)
         score = cosine_similarity(query_vec, vec)[0][0]
-        
-        # Append the score and text to the scored list
         scored.append((score, text))
-    
-    # Sort the scored documents by score in descending order
+
     scored.sort(reverse=True, key=lambda x: x[0])
-    
-    # Return the top-k most similar texts
     return [text for _, text in scored[:top_k]]
+
 
 def answer_question_with_context(query, context_chunks):
     """
