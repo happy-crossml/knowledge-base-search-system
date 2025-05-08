@@ -1,0 +1,225 @@
+
+import streamlit as st
+import PyPDF2
+import redis
+import uuid
+import tiktoken
+import json
+from groq import Groq
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+
+# Initialize Redis connection
+redis_client = redis.Redis(
+    host='localhost',
+    port=6379,
+    decode_responses=True
+)
+
+# Set up Groq API client with your API key
+GROQ_API_KEY = "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"
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+# Tokenizer used to estimate token length (based on OpenAI's tiktoken)
+tokenizer = tiktoken.get_encoding("cl100k_base")
+
+def extract_text_from_pdf(uploaded_file):
+    """
+    Extracts all text from a given uploaded PDF file.
+
+    Args:
+        uploaded_file: A PDF file uploaded via Streamlit.
+
+    Returns:
+        str: The extracted text from all pages.
+    """
+    reader = PyPDF2.PdfReader(uploaded_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+
+def preprocess_text(text, max_chunk_tokens=200):
+    """
+    Splits large text into smaller chunks based on token count.
+
+    Args:
+        text (str): The full extracted text from the PDF.
+        max_chunk_tokens (int): Maximum token count per chunk.
+
+    Returns:
+        List[str]: List of token-safe chunks.
+    """
+    words = text.split()
+    chunks, chunk = [], []
+    token_count = 0
+    for word in words:
+        word_tokens = len(tokenizer.encode(word))
+        if token_count + word_tokens > max_chunk_tokens:
+            chunks.append(" ".join(chunk))
+            chunk = []
+            token_count = 0
+        chunk.append(word)
+        token_count += word_tokens
+    if chunk:
+        chunks.append(" ".join(chunk))
+    return chunks
+
+def embed_text(text):
+    """
+    Generates an embedding vector for a given text using Groq's LLaMA model.
+
+    Args:
+        text (str): Text to embed.
+
+    Returns:
+        List[float]: A list of floats representing the embedding vector.
+    """
+    response = groq_client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[
+            {
+                "role": "system",
+                "content": "Generate an embedding vector (return only numbers, comma separated)"
+            },
+            {"role": "user", "content": text}
+        ],
+        temperature=0.0,
+        max_tokens=512,
+        stop=None,
+    )
+    content = response.choices[0].message.content.strip()
+    try:
+        vector = [float(x) for x in content.split(",")]
+    except ValueError:
+        # If embedding fails, return a random fallback vector
+        vector = np.random.rand(512).tolist()
+    return vector
+
+def store_chunk_in_redis(text_chunk, vector, file_id):
+    """
+    Stores a single chunk and its embedding in Redis.
+
+    Args:
+        text_chunk (str): The chunk of text.
+        vector (List[float]): The corresponding embedding vector.
+        file_id (str): UUID representing the uploaded file.
+    """
+    vector_key = f"doc:{file_id}:{str(uuid.uuid4())}"
+    redis_client.hset(vector_key, mapping={
+        "text": text_chunk,
+        "vector": json.dumps(vector),
+    })
+
+def similarity_search(query, top_k=3):
+    """
+    Finds the top-k most relevant chunks for a given query using cosine similarity.
+
+    Args:
+        query (str): The user's question or query.
+        top_k (int): Number of most similar chunks to retrieve.
+
+    Returns:
+        List[str]: List of top-k relevant text chunks.
+    """
+    # Embed the query and ensure it has shape (1, 512)
+    query_vec = np.array(embed_text(query)).reshape(1, -1)
+    
+    # Retrieve all document keys from Redis
+    all_docs = [key for key in redis_client.scan_iter("doc:*")]
+    
+    scored = []
+    
+    # Loop through all documents
+    for key in all_docs:
+        # Retrieve the text and vector from Redis
+        text = redis_client.hget(key, "text")
+        vec = json.loads(redis_client.hget(key, "vector"))
+        
+        # Convert the vector into a numpy array
+        vec = np.array(vec)
+        
+        # Debugging: Print the shapes of the query and document vectors
+        print(f"Query vector shape: {query_vec.shape}")
+        print(f"Document vector shape: {vec.shape}")
+        
+        # Check if the document vector has the correct shape (512,)
+        if vec.shape[0] != 512:
+            print(f"Skipping document with vector of shape {vec.shape}")
+            continue  # Skip this document
+        
+        # Reshape the document vector to (1, 512) if it's 1D
+        if vec.ndim == 1:
+            vec = vec.reshape(1, -1)
+        
+        # Compute the cosine similarity between the query vector and document vector
+        score = cosine_similarity(query_vec, vec)[0][0]
+        
+        # Append the score and text to the scored list
+        scored.append((score, text))
+    
+    # Sort the scored documents by score in descending order
+    scored.sort(reverse=True, key=lambda x: x[0])
+    
+    # Return the top-k most similar texts
+    return [text for _, text in scored[:top_k]]
+
+def answer_question_with_context(query, context_chunks):
+    """
+    Answers a user's question using retrieved relevant context chunks.
+
+    Args:
+        query (str): The user's question.
+        context_chunks (List[str]): Retrieved relevant text chunks.
+
+    Returns:
+        str: The final answer generated by the model.
+    """
+    if not context_chunks:  # Check if there are no context chunks
+        return "No details available on Harry in the current context." 
+    
+    context = "\n".join(context_chunks)
+    response = groq_client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful assistant answering questions based on documents."
+            },
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
+        ],
+        temperature=0.2,
+    )
+    return response.choices[0].message.content.strip()
+
+
+# -------------------- Streamlit App UI --------------------
+
+st.set_page_config(page_title="PDF Q&A with LLaMA and Redis", layout="wide")
+st.title("🤖 Intelligent PDF Chat Assistant")
+
+uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
+if uploaded_file:
+    file_text = extract_text_from_pdf(uploaded_file)
+    chunks = preprocess_text(file_text)
+    file_id = str(uuid.uuid4())
+    
+    with st.spinner("Indexing chunks in Redis..."):
+        for chunk in chunks:
+            vector = embed_text(chunk)
+            store_chunk_in_redis(chunk, vector, file_id)
+            
+    st.success("PDF content indexed successfully.")
+
+query = st.text_input("Ask a question about the PDF content:")
+if query:
+    with st.spinner("Thinking..."):
+        retrieved_chunks = similarity_search(query)
+        answer = answer_question_with_context(query, retrieved_chunks)
+        st.subheader("Answer")
+        st.write(answer)
+
+        with st.expander("🔍 Context used"):
+            for i, chunk in enumerate(retrieved_chunks, 1):
+                st.markdown(f"**Chunk {i}:**\n{chunk}")
